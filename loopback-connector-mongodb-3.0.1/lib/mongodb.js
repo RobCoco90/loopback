@@ -12,7 +12,9 @@ var util = require('util');
 var async = require('async');
 var Connector = require('loopback-connector').Connector;
 var debug = require('debug')('loopback:connector:mongodb');
-
+var _ = require('lodash');
+let q = require('q');
+let dbs = require('../../../server/db_map.json')
 /*!
  * Convert the id to be a BSON ObjectID if it is compatible
  * @param {*} id The id value
@@ -269,6 +271,14 @@ MongoDB.prototype.toDatabase = function(model, data) {
   return data;
 };
 
+var dsChanger = function(self, clienteId){
+  let newDb = dbs[clienteId];
+  if(!newDb){
+    newDb = dbs.default;
+  }
+  self.db = self.db.db(newDb);
+};
+
 /**
  * Execute a mongodb command
  * @param {String} model The model name
@@ -277,6 +287,7 @@ MongoDB.prototype.toDatabase = function(model, data) {
  */
 MongoDB.prototype.execute = function(model, command) {
   var collection = this.collection(model);
+  var self = this;
   // Get the parameters for the given command
   var args = [].slice.call(arguments, 2);
   // The last argument must be a callback function
@@ -299,9 +310,61 @@ MongoDB.prototype.execute = function(model, command) {
       done(err, result);
     };
     debug('MongoDB: model=%s command=%s', model, command, args);
+
+    let clienteId = null;
+    //cerco il clienteId nelle options
+    let optionsIndex = _.findIndex(args, function(arg){
+      if(Object.keys(arg).indexOf('__ctx') !== -1){
+        return arg;
+      }
+    });
+    if(optionsIndex !== -1){
+      let options = args[optionsIndex];
+      clienteId = options.__ctx.clienteId;
+      args.splice(optionsIndex, 1);
+    } else if(optionsIndex === -1) {
+      //per il login utente non possiede option
+      args.splice(args.length-2, 1);
+    }
+    //se non lo trovo nelle options cerco nei filtri
+    if(!clienteId){
+      for(var i = 0; i < args.length; i++){
+        if(Object.keys(args[i])[0] === '$and'){
+          clienteId = _.find(args[i].$and, function(condizione){
+            if(Object.keys(condizione)[0] === 'clienteId' || Object.keys(condizione)[0] === 'realm'){
+              return condizione;
+            }
+          });
+          if(clienteId){
+            clienteId = clienteId.clienteId || clienteId.realm;
+            break;
+          }
+        }
+        if(Object.keys(args[i])[0] === '$set'){
+          clienteId = args[i].$set.clienteId;
+          if(clienteId){
+            break;
+          }
+        }
+      }
+    }
+    if(model !== 'AccessToken' && model !== 'Cliente'
+    && !clienteId){
+      console.log('clienteId mancante execute(' + model + ', ' + command + ')');
+    }
+    dsChanger(self, clienteId);
+    collection = self.collection(model);
     return collection[command].apply(collection, args);
+
   }, callback);
 };
+
+let sleep = q.async(function*() {
+  let promise = new Promise(function(resolve, reject){
+    setTimeout(resolve, 5000);
+  });
+  return promise;
+});
 
 MongoDB.prototype.coerceId = function(model, id) {
   // See https://github.com/strongloop/loopback-connector-mongodb/issues/206
@@ -352,7 +415,7 @@ MongoDB.prototype.create = function(model, data, options, callback) {
 
   data = self.toDatabase(model, data);
 
-  this.execute(model, 'insert', data, { safe: true }, function(err, result) {
+  this.execute(model, 'insert', data, { safe: true }, options, function(err, result) {
     if (self.debug) {
       debug('create.callback', model, err, result);
     }
@@ -392,7 +455,7 @@ MongoDB.prototype.save = function(model, data, options, callback) {
 
   data = self.toDatabase(model, data);
 
-  this.execute(model, 'save', data, { w: 1 }, function(err, result) {
+  this.execute(model, 'save', data, { w: 1 }, options, function(err, result) {
     if (!err) {
       self.setIdValue(model, data, idValue);
       idName !== '_id' && delete data._id;
@@ -434,7 +497,7 @@ MongoDB.prototype.exists = function(model, id, options, callback) {
     debug('exists', model, id);
   }
   id = self.coerceId(model, id);
-  this.execute(model, 'findOne', { _id: id }, function(err, data) {
+  this.execute(model, 'findOne', { _id: id }, options, function(err, data) {
     if (self.debug) {
       debug('exists.callback', model, id, err, data);
     }
@@ -455,7 +518,7 @@ MongoDB.prototype.find = function find(model, id, options, callback) {
   }
   var idName = self.idName(model);
   var oid = self.coerceId(model, id);
-  this.execute(model, 'findOne', { _id: oid }, function(err, data) {
+  this.execute(model, 'findOne', { _id: oid }, options, function(err, data) {
     if (self.debug) {
       debug('find.callback', model, id, err, data);
     }
@@ -548,7 +611,7 @@ MongoDB.prototype.updateOrCreate = function updateOrCreate(model, data, options,
     _id: oid,
   }, [
     ['_id', 'asc'],
-  ], data, { upsert: true, new: true }, function(err, result) {
+  ], data, { upsert: true, new: true }, options, function(err, result) {
     if (self.debug) {
       debug('updateOrCreate.callback', model, id, err, result);
     }
@@ -604,7 +667,7 @@ MongoDB.prototype.destroy = function destroy(model, id, options, callback) {
     debug('delete', model, id);
   }
   id = self.coerceId(model, id);
-  this.execute(model, 'remove', { _id: id }, function(err, result) {
+  this.execute(model, 'remove', { _id: id }, options, function(err, result) {
     if (self.debug) {
       debug('delete.callback', model, id, err, result);
     }
@@ -929,9 +992,9 @@ MongoDB.prototype.all = function all(model, filter, options, callback) {
   fields = self.fromPropertyToDatabaseNames(model, fields);
 
   if (fields) {
-    this.execute(model, 'find', query, fields, processResponse);
+    this.execute(model, 'find', query, fields, options, processResponse);
   } else {
-    this.execute(model, 'find', query, processResponse);
+    this.execute(model, 'find', query, options, processResponse);
   }
 
   function processResponse(err, cursor) {
@@ -1028,7 +1091,7 @@ MongoDB.prototype.destroyAll = function destroyAll(model, where, options, callba
     where = undefined;
   }
   where = self.buildWhere(model, where);
-  this.execute(model, 'remove', where || {}, function(err, info) {
+  this.execute(model, 'remove', where || {}, options, function(err, info) {
     if (err) return callback && callback(err);
 
     if (self.debug)
@@ -1054,7 +1117,7 @@ MongoDB.prototype.count = function count(model, where, options, callback) {
     debug('count', model, where);
   }
   where = self.buildWhere(model, where);
-  this.execute(model, 'count', where, function(err, count) {
+  this.execute(model, 'count', where, options, function(err, count) {
     if (self.debug) {
       debug('count.callback', model, err, count);
     }
@@ -1152,7 +1215,7 @@ MongoDB.prototype.updateAttributes = function updateAttrs(model, id, data, optio
 
   this.execute(model, 'findAndModify', { _id: oid }, [
     ['_id', 'asc'],
-  ], data, {}, function(err, result) {
+  ], data, {}, options, function(err, result) {
     if (self.debug) {
       debug('updateAttributes.callback', model, id, err, result);
     }
@@ -1190,7 +1253,7 @@ MongoDB.prototype.update =
     // Check for other operators and sanitize the data obj
     data = self.parseUpdateData(model, data, options);
 
-    this.execute(model, 'update', where, data, { multi: true, upsert: false },
+    this.execute(model, 'update', where, data, { multi: true, upsert: false }, options,
       function(err, info) {
         if (err) return cb && cb(err);
 
